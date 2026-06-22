@@ -17,6 +17,9 @@
             postgresql_14
             pgcli
             postgresql_14.lib
+            go
+            goose
+            sqlc
           ];
 
           # Shell hook for additional environment setup
