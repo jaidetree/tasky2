@@ -1,5 +1,5 @@
 # Tasky build targets. Run inside the Nix dev shell (direnv loads it) so go,
-# node, and goose are on PATH. See spec.md and docs/adr/ for the decisions here.
+# node, and goose are on PATH. See docs/adr/ for the decisions here.
 
 BACKEND  := backend
 FRONTEND := frontend

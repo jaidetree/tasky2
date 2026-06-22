@@ -1,9 +1,9 @@
 # Tasky
 
 Personal, single-user web app holding a pool of tasks; a button plays an
-animation that picks one at random to do. See [`spec.md`](./spec.md) for the
-functional + structural spec, [`CONTEXT.md`](./CONTEXT.md) for the domain
-glossary, and [`docs/adr/`](./docs/adr/) for the decisions behind the design.
+animation that picks one at random to do. See [`CONTEXT.md`](./CONTEXT.md) for
+the domain glossary and [`docs/adr/`](./docs/adr/) for the decisions behind the
+design.
 
 ## Stack
 
