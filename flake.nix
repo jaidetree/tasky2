@@ -19,12 +19,14 @@
             postgresql_14.lib
             go
             goose
-            sqlc
+            nodejs_22
           ];
 
           # Shell hook for additional environment setup
           shellHook = ''
             echo "Postgres version: $(postgres --version)"
+            echo "Go version: $(go version)"
+            echo "Node version: $(node --version)"
           '';
         };
       }
