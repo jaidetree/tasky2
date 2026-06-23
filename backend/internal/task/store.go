@@ -2,7 +2,9 @@ package task
 
 import (
 	"context"
+	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -76,4 +78,30 @@ func (s *Store) ListActive(ctx context.Context) ([]Task, error) {
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// Pick atomically transitions a single Pending Task to In Progress, enforcing
+// the In-Progress limit. The whole guard lives in one statement so the check
+// and the write cannot race: the UPDATE's WHERE clause requires the target row
+// to be Pending and live, and a correlated subquery requires the current live
+// In-Progress count to be below maxInProgress. If no row qualifies, RETURNING
+// yields no rows (pgx.ErrNoRows), which maps to ErrPickRejected.
+func (s *Store) Pick(ctx context.Context, id int64, maxInProgress int) (Task, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE tasks
+		    SET status = 'in_progress'
+		  WHERE id = $1
+		    AND status = 'pending'
+		    AND deleted_at IS NULL
+		    AND (SELECT count(*) FROM tasks
+		          WHERE status = 'in_progress'
+		            AND deleted_at IS NULL) < $2
+		 RETURNING `+taskColumns,
+		id, maxInProgress,
+	)
+	t, err := scanTask(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Task{}, ErrPickRejected
+	}
+	return t, err
 }

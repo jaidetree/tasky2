@@ -98,8 +98,13 @@ components:
           type:
             - array
             - "null"
+        max_in_progress:
+          description: Server-enforced limit on concurrent In Progress tasks
+          format: int64
+          type: integer
       required:
         - active
+        - max_in_progress
       type: object
     TaskDTO:
       additionalProperties: false
@@ -200,5 +205,34 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
       summary: Create a task
+      tags:
+        - tasks
+  /tasks/{id}/pick:
+    post:
+      description: "Transition a Pending task to In Progress. The server validates the pick in one transaction: the task must still be Pending and the In-Progress limit must not be reached. A pick that matches no eligible row is rejected with 409 Conflict."
+      operationId: pickTask
+      parameters:
+        - description: Identifier of the Pending task to pick
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Identifier of the Pending task to pick
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDTO"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Pick a task
       tags:
         - tasks

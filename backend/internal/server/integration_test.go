@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,8 +31,16 @@ type harness struct {
 	pool    *pgxpool.Pool
 }
 
-// newHarness brings up the full stack against a freshly truncated test database.
+// newHarness brings up the full stack against a freshly truncated test database
+// with the default In-Progress limit of 1.
 func newHarness(t *testing.T) *harness {
+	return newHarnessWithLimit(t, 1)
+}
+
+// newHarnessWithLimit is newHarness parameterized by the In-Progress limit, so
+// tests can exercise the configurable limit at both the default 1 and a raised
+// value (the PRD requires verifying both).
+func newHarnessWithLimit(t *testing.T, maxInProgress int) *harness {
 	t.Helper()
 	ctx := context.Background()
 
@@ -43,7 +52,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("truncate tasks: %v", err)
 	}
 
-	svc := task.NewService(task.NewStore(pool), 1)
+	svc := task.NewService(task.NewStore(pool), maxInProgress)
 	srv := httptest.NewServer(server.New(svc, ""))
 
 	t.Cleanup(func() {
@@ -136,7 +145,33 @@ type taskResponse struct {
 }
 
 type listResponse struct {
-	Active []taskResponse `json:"active"`
+	Active        []taskResponse `json:"active"`
+	MaxInProgress int            `json:"max_in_progress"`
+}
+
+// statusOf reads the persisted status of a task directly from the DB, for
+// asserting that a rejected pick left state unchanged.
+func (h *harness) statusOf(t *testing.T, id int64) string {
+	t.Helper()
+	var status string
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT status FROM tasks WHERE id = $1", id).Scan(&status); err != nil {
+		t.Fatalf("read status of task %d: %v", id, err)
+	}
+	return status
+}
+
+// seedTask inserts a task directly with the given status/position and returns
+// its id, bypassing the API so picks can be set up from any starting state.
+func (h *harness) seedTask(t *testing.T, title, status string, position int) int64 {
+	t.Helper()
+	var id int64
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO tasks (title, status, position) VALUES ($1, $2, $3) RETURNING id`,
+		title, status, position).Scan(&id); err != nil {
+		t.Fatalf("seed %q: %v", title, err)
+	}
+	return id
 }
 
 // --- tests -----------------------------------------------------------------
@@ -313,5 +348,119 @@ func TestListEmptyPool(t *testing.T) {
 	}
 	if len(list.Active) != 0 {
 		t.Errorf("active has %d tasks, want 0", len(list.Active))
+	}
+}
+
+// The list response carries the server-enforced In-Progress limit so the
+// frontend can disable Pick at the limit; it reflects the configured value.
+func TestListReportsMaxInProgress(t *testing.T) {
+	h := newHarnessWithLimit(t, 3)
+
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	if list.MaxInProgress != 3 {
+		t.Errorf("max_in_progress = %d, want 3", list.MaxInProgress)
+	}
+}
+
+// --- pick ------------------------------------------------------------------
+
+func pickPath(id int64) string {
+	return "/tasks/" + strconv.FormatInt(id, 10) + "/pick"
+}
+
+// Pick a Pending task → it becomes In Progress, in both the response and the DB.
+func TestPickPendingBecomesInProgress(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "Wash the dishes", "pending", 1)
+
+	resp := h.post(t, pickPath(id), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pick status = %d, want 200", resp.StatusCode)
+	}
+	picked := decode[taskResponse](t, resp)
+	if picked.ID != id {
+		t.Errorf("picked id = %d, want %d", picked.ID, id)
+	}
+	if picked.Status != "in_progress" {
+		t.Errorf("response status = %q, want in_progress", picked.Status)
+	}
+	if got := h.statusOf(t, id); got != "in_progress" {
+		t.Errorf("persisted status = %q, want in_progress", got)
+	}
+}
+
+// Pick at the In-Progress limit is rejected with 409 (a client toast, not a
+// 500) and leaves the Pending task untouched.
+func TestPickAtLimitRejected(t *testing.T) {
+	h := newHarness(t) // limit 1
+	h.seedTask(t, "already going", "in_progress", 1)
+	pending := h.seedTask(t, "waiting", "pending", 2)
+
+	resp := h.post(t, pickPath(pending), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("pick status = %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if got := h.statusOf(t, pending); got != "pending" {
+		t.Errorf("persisted status = %q, want pending (no state change)", got)
+	}
+}
+
+// With a raised limit the same scenario succeeds: a second pick is allowed up
+// to the limit, then the third is rejected — proving the limit is configurable.
+func TestPickRespectsRaisedLimit(t *testing.T) {
+	h := newHarnessWithLimit(t, 3)
+	first := h.seedTask(t, "one", "pending", 1)
+	second := h.seedTask(t, "two", "pending", 2)
+	third := h.seedTask(t, "three", "pending", 3)
+	fourth := h.seedTask(t, "four", "pending", 4)
+
+	for _, id := range []int64{first, second, third} {
+		resp := h.post(t, pickPath(id), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("pick %d status = %d, want 200", id, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	// Fourth pick is over the limit of 3 → rejected, left Pending.
+	resp := h.post(t, pickPath(fourth), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("over-limit pick status = %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if got := h.statusOf(t, fourth); got != "pending" {
+		t.Errorf("persisted status = %q, want pending (no state change)", got)
+	}
+}
+
+// Pick on an empty Pool (no such task / nothing eligible) is rejected with 409.
+func TestPickEmptyPoolRejected(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.post(t, pickPath(999), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("pick status = %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// Pick of a non-Pending task (In Progress or Completed) is rejected with 409
+// and the task keeps its status — the transition runs once, server-validated.
+func TestPickNonPendingRejected(t *testing.T) {
+	for _, status := range []string{"in_progress", "completed"} {
+		t.Run(status, func(t *testing.T) {
+			h := newHarnessWithLimit(t, 3) // headroom, so only the status guard applies
+			id := h.seedTask(t, "already "+status, status, 1)
+
+			resp := h.post(t, pickPath(id), nil)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("pick status = %d, want 409", resp.StatusCode)
+			}
+			resp.Body.Close()
+			if got := h.statusOf(t, id); got != status {
+				t.Errorf("persisted status = %q, want %q (no state change)", got, status)
+			}
+		})
 	}
 }

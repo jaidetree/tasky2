@@ -49,11 +49,19 @@ type TaskOutput struct {
 	Body taskDTO
 }
 
-// ListTasksOutput is the GET /tasks response: the active pool.
+// ListTasksOutput is the GET /tasks response: the active pool plus the
+// server-enforced In-Progress limit, so the frontend can disable Pick at the
+// limit without a second round-trip.
 type ListTasksOutput struct {
 	Body struct {
-		Active []taskDTO `json:"active" doc:"Active pool: Pending and In Progress tasks, manually ordered"`
+		Active        []taskDTO `json:"active" doc:"Active pool: Pending and In Progress tasks, manually ordered"`
+		MaxInProgress int       `json:"max_in_progress" doc:"Server-enforced limit on concurrent In Progress tasks"`
 	}
+}
+
+// PickTaskInput is the POST /tasks/{id}/pick path-only request.
+type PickTaskInput struct {
+	ID int64 `path:"id" doc:"Identifier of the Pending task to pick"`
 }
 
 // RegisterRoutes registers the task operations on the huma API. The handlers
@@ -95,6 +103,25 @@ func RegisterRoutes(api huma.API, svc *Service) {
 		for _, t := range tasks {
 			out.Body.Active = append(out.Body.Active, toDTO(t))
 		}
+		out.Body.MaxInProgress = svc.MaxInProgress()
 		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "pickTask",
+		Method:      http.MethodPost,
+		Path:        "/tasks/{id}/pick",
+		Summary:     "Pick a task",
+		Description: "Transition a Pending task to In Progress. The server validates the pick in one transaction: the task must still be Pending and the In-Progress limit must not be reached. A pick that matches no eligible row is rejected with 409 Conflict.",
+		Tags:        []string{"tasks"},
+	}, func(ctx context.Context, in *PickTaskInput) (*TaskOutput, error) {
+		t, err := svc.Pick(ctx, in.ID)
+		if err != nil {
+			if errors.Is(err, ErrPickRejected) {
+				return nil, huma.Error409Conflict("task is not pending or the in-progress limit is reached")
+			}
+			return nil, huma.Error500InternalServerError("could not pick task", err)
+		}
+		return &TaskOutput{Body: toDTO(t)}, nil
 	})
 }

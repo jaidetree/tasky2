@@ -7,7 +7,7 @@ import type { paths } from "./schema";
 export const api = createClient<paths>({ baseUrl: "/" });
 
 // Task shape pulled from the generated schema so the UI tracks the contract.
-type ActiveList = NonNullable<
-  paths["/tasks"]["get"]["responses"]["200"]["content"]["application/json"]["active"]
->;
+type ListBody =
+  paths["/tasks"]["get"]["responses"]["200"]["content"]["application/json"];
+type ActiveList = NonNullable<ListBody["active"]>;
 export type Task = ActiveList[number];
