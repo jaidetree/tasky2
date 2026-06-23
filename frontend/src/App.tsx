@@ -127,6 +127,19 @@ export function App() {
     await refresh();
   }
 
+  // Cancel a task (soft delete), allowed from any status. The server filters
+  // cancelled tasks from every view; a rejection surfaces as the existing message.
+  async function onCancel(id: number) {
+    setError(null);
+    const { error } = await api.DELETE("/tasks/{id}", {
+      params: { path: { id } },
+    });
+    if (error) {
+      setError("Could not cancel the task — try again.");
+    }
+    await refresh();
+  }
+
   const inProgressCount = tasks.filter((t) => t.status === "in_progress").length;
   const pendingCount = tasks.filter((t) => t.status === "pending").length;
   const animating = highlightIndex !== null;
@@ -198,6 +211,9 @@ export function App() {
                     Complete
                   </button>
                 )}
+                <button onClick={() => onCancel(task.id)} style={{ marginLeft: 8 }}>
+                  Cancel
+                </button>
                 {task.notes && <div>{task.notes}</div>}
               </motion.li>
             );

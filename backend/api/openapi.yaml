@@ -223,6 +223,35 @@ paths:
       summary: Create a task
       tags:
         - tasks
+  /tasks/{id}:
+    delete:
+      description: Cancel a task as an orthogonal soft delete (stamping deleted_at), allowed from any status. A cancelled task is filtered from every view. Cancelling a task that is missing or already cancelled is rejected with 404 Not Found.
+      operationId: cancelTask
+      parameters:
+        - description: Identifier of the task to cancel (soft delete)
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Identifier of the task to cancel (soft delete)
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDTO"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Cancel a task
+      tags:
+        - tasks
   /tasks/{id}/complete:
     post:
       description: Transition an In Progress task to Completed, stamping the completion time. Completed is terminal. Completing a task that is not In Progress is rejected with 409 Conflict.

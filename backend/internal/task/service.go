@@ -22,6 +22,12 @@ var ErrPickRejected = errors.New("pick rejected: task is not pending or the in-p
 // Completed is terminal. The API maps this to a client-visible toast, not a 500.
 var ErrCompleteRejected = errors.New("complete rejected: task is not in progress")
 
+// ErrCancelRejected is returned when a Cancel matches no live row: the Task is
+// missing or already cancelled (soft-deleted). Cancel is an orthogonal soft
+// delete allowed from any status, so the only rejection is "no live row". The
+// API maps this to a 404 Not Found, not a 500.
+var ErrCancelRejected = errors.New("cancel rejected: task is missing or already cancelled")
+
 // Service holds the Task lifecycle rules. It sits between the HTTP handlers and
 // the Store. maxInProgress is the configurable concurrency limit (default 1,
 // scales to 3) enforced server-side; it is unused until the Pick slice but is
@@ -87,4 +93,12 @@ func (s *Service) Pick(ctx context.Context, id int64) (Task, error) {
 // In Progress it returns ErrCompleteRejected (mapped by the API to a toast).
 func (s *Service) Complete(ctx context.Context, id int64) (Task, error) {
 	return s.store.Complete(ctx, id)
+}
+
+// Cancel soft-deletes a Task by stamping deleted_at, allowed from any status.
+// It is a single guarded statement: only a live (not already cancelled) row
+// matches. If no live row matches (missing or already cancelled) it returns
+// ErrCancelRejected (mapped by the API to a 404).
+func (s *Service) Cancel(ctx context.Context, id int64) (Task, error) {
+	return s.store.Cancel(ctx, id)
 }

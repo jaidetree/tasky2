@@ -82,6 +82,11 @@ type CompleteTaskInput struct {
 	ID int64 `path:"id" doc:"Identifier of the In-Progress task to complete"`
 }
 
+// CancelTaskInput is the DELETE /tasks/{id} path-only request.
+type CancelTaskInput struct {
+	ID int64 `path:"id" doc:"Identifier of the task to cancel (soft delete)"`
+}
+
 // RegisterRoutes registers the task operations on the huma API. The handlers
 // are the source of truth from which the OpenAPI spec is generated (ADR-0003).
 func RegisterRoutes(api huma.API, svc *Service) {
@@ -164,6 +169,24 @@ func RegisterRoutes(api huma.API, svc *Service) {
 				return nil, huma.Error409Conflict("task is not in progress")
 			}
 			return nil, huma.Error500InternalServerError("could not complete task", err)
+		}
+		return &TaskOutput{Body: toDTO(t)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "cancelTask",
+		Method:      http.MethodDelete,
+		Path:        "/tasks/{id}",
+		Summary:     "Cancel a task",
+		Description: "Cancel a task as an orthogonal soft delete (stamping deleted_at), allowed from any status. A cancelled task is filtered from every view. Cancelling a task that is missing or already cancelled is rejected with 404 Not Found.",
+		Tags:        []string{"tasks"},
+	}, func(ctx context.Context, in *CancelTaskInput) (*TaskOutput, error) {
+		t, err := svc.Cancel(ctx, in.ID)
+		if err != nil {
+			if errors.Is(err, ErrCancelRejected) {
+				return nil, huma.Error404NotFound("task is missing or already cancelled")
+			}
+			return nil, huma.Error500InternalServerError("could not cancel task", err)
 		}
 		return &TaskOutput{Body: toDTO(t)}, nil
 	})

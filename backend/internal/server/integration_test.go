@@ -599,6 +599,148 @@ func TestCompleteNonInProgressRejected(t *testing.T) {
 	}
 }
 
+// --- cancel ----------------------------------------------------------------
+
+func cancelPath(id int64) string {
+	return "/tasks/" + strconv.FormatInt(id, 10)
+}
+
+// del issues a DELETE request, the verb Cancel (soft delete) is registered on.
+func (h *harness) del(t *testing.T, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, h.baseURL+path, nil)
+	if err != nil {
+		t.Fatalf("build DELETE %s: %v", path, err)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE %s: %v", path, err)
+	}
+	return resp
+}
+
+// deletedAtOf reads the persisted deleted_at directly from the DB, for asserting
+// the soft-delete stamp (or its absence after a rejected cancel).
+func (h *harness) deletedAtOf(t *testing.T, id int64) *time.Time {
+	t.Helper()
+	var deletedAt *time.Time
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT deleted_at FROM tasks WHERE id = $1", id).Scan(&deletedAt); err != nil {
+		t.Fatalf("read deleted_at of task %d: %v", id, err)
+	}
+	return deletedAt
+}
+
+// Cancel a Pending task → 200 with the cancelled DTO, deleted_at stamped in the
+// DB, and the task gone from the active list.
+func TestCancelPendingSoftDeletes(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "Wash the dishes", "pending", 1)
+
+	resp := h.del(t, cancelPath(id))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %d, want 200", resp.StatusCode)
+	}
+	cancelled := decode[taskResponse](t, resp)
+	if cancelled.ID != id {
+		t.Errorf("cancelled id = %d, want %d", cancelled.ID, id)
+	}
+
+	if h.deletedAtOf(t, id) == nil {
+		t.Errorf("persisted deleted_at is NULL, want a timestamp")
+	}
+
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	if containsID(list.Active, id) {
+		t.Errorf("cancelled task %d still in active list", id)
+	}
+}
+
+// Cancel an In-Progress task → 200 and gone from the active list (Cancel is
+// allowed from any status).
+func TestCancelInProgressRemovesFromActive(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "already going", "in_progress", 1)
+
+	resp := h.del(t, cancelPath(id))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if h.deletedAtOf(t, id) == nil {
+		t.Errorf("persisted deleted_at is NULL, want a timestamp")
+	}
+
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	if containsID(list.Active, id) {
+		t.Errorf("cancelled task %d still in active list", id)
+	}
+}
+
+// Cancel a Completed task → 200 and gone from BOTH completed views, recently and
+// older (Cancel filters from every view).
+func TestCancelCompletedRemovesFromCompletedViews(t *testing.T) {
+	h := newHarness(t)
+	recent := h.seedCompleted(t, "an hour ago", "1 hour")
+	older := h.seedCompleted(t, "a day and an hour ago", "25 hours")
+
+	for _, id := range []int64{recent, older} {
+		resp := h.del(t, cancelPath(id))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("cancel %d status = %d, want 200", id, resp.StatusCode)
+		}
+		resp.Body.Close()
+		if h.deletedAtOf(t, id) == nil {
+			t.Errorf("task %d: persisted deleted_at is NULL, want a timestamp", id)
+		}
+	}
+
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	if containsID(list.RecentlyCompleted, recent) {
+		t.Errorf("cancelled task %d still in recently_completed", recent)
+	}
+	if containsID(list.OlderCompleted, older) {
+		t.Errorf("cancelled task %d still in older_completed", older)
+	}
+}
+
+// Cancel of a missing id → 404, and (for an already-cancelled id) a second
+// cancel → 404 with no unexpected DB change (deleted_at stays at its first
+// stamp; the cancelled task never reappears in any list).
+func TestCancelMissingOrAlreadyCancelledRejected(t *testing.T) {
+	h := newHarness(t)
+
+	// Missing id → 404.
+	resp := h.del(t, cancelPath(999))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cancel of missing id status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Cancel once, capture the stamp, then cancel again → 404, stamp unchanged.
+	id := h.seedTask(t, "to cancel twice", "pending", 1)
+	if r := h.del(t, cancelPath(id)); r.StatusCode != http.StatusOK {
+		t.Fatalf("first cancel status = %d, want 200", r.StatusCode)
+	} else {
+		r.Body.Close()
+	}
+	firstStamp := h.deletedAtOf(t, id)
+	if firstStamp == nil {
+		t.Fatalf("after first cancel deleted_at is NULL, want a timestamp")
+	}
+
+	resp = h.del(t, cancelPath(id))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("second cancel status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if got := h.deletedAtOf(t, id); got == nil || !got.Equal(*firstStamp) {
+		t.Errorf("deleted_at changed on rejected re-cancel: got %v, want %v", got, firstStamp)
+	}
+}
+
 // equalIDs reports whether two id slices are equal in order.
 func equalIDs(a, b []int64) bool {
 	if len(a) != len(b) {

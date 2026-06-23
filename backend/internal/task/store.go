@@ -156,3 +156,23 @@ func (s *Store) Complete(ctx context.Context, id int64) (Task, error) {
 	}
 	return t, err
 }
+
+// Cancel atomically soft-deletes a single Task by stamping deleted_at, allowed
+// from any status. One guarded statement, mirroring Pick/Complete: the WHERE
+// clause requires the row to still be live (deleted_at IS NULL), so a missing
+// or already-cancelled row matches nothing -> pgx.ErrNoRows -> ErrCancelRejected.
+func (s *Store) Cancel(ctx context.Context, id int64) (Task, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE tasks
+		    SET deleted_at = now()
+		  WHERE id = $1
+		    AND deleted_at IS NULL
+		 RETURNING `+taskColumns,
+		id,
+	)
+	t, err := scanTask(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Task{}, ErrCancelRejected
+	}
+	return t, err
+}
