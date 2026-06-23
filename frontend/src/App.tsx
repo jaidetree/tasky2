@@ -1,16 +1,33 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { motion } from "motion/react";
 import { api, type Task } from "./api/client";
 
 // Disposable prototype UI: create a task, see the active pool, and Pick a
-// Pending task into In Progress. Intentionally minimal — the Pick animation and
-// polish come in later slices (PRD: don't gold-plate). The Pick button here is
-// plain (un-animated) and picks any Pending task to exercise the server path.
+// Pending task into In Progress. The Pick animation IS the draw (ADR-0002): a
+// highlight cycles down the Pool with an outdent for physicality, decelerating
+// (ease-out) onto the winner, then auto-commits via the Pick endpoint.
+
+// Ease-out timing for the highlight cycle. Returns the delay (ms) before the
+// step AFTER index `i` of `total` — small early (fast cycling), large at the
+// end (the highlight visibly slows and settles). This is purely the FEEL of the
+// deceleration: it changes WHEN each step happens, never WHICH index is landed
+// on (that is fixed up-front as start + steps), so easing cannot bias the draw.
+function stepDelay(i: number, total: number): number {
+  const progress = total <= 1 ? 1 : i / (total - 1); // 0 → 1 across the cycle
+  const eased = 1 - (1 - progress) * (1 - progress); // ease-out (quadratic)
+  return 55 + eased * 280; // ~55ms fast → ~335ms slow on the final step
+}
+
 export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [maxInProgress, setMaxInProgress] = useState(1);
   const [title, setTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Index (within the Pending Pool) currently lit by the cycling highlight, or
+  // null when no animation is running.
+  const [highlightIndex, setHighlightIndex] = useState<number | null>(null);
+  const animatingRef = useRef(false);
 
   async function refresh() {
     const { data, error } = await api.GET("/tasks");
@@ -41,26 +58,67 @@ export function App() {
     await refresh();
   }
 
-  // Pick the first Pending task. The server independently validates the pick;
-  // a rejection (limit reached, not Pending) surfaces as a toast, not a crash.
-  async function onPick() {
-    setError(null);
-    const pending = tasks.find((t) => t.status === "pending");
-    if (!pending) return;
+  // Commit a Pick to the server. The server independently validates it (still
+  // Pending, under the limit); a rejection surfaces as a toast, not a crash.
+  async function commitPick(id: number) {
     const { error } = await api.POST("/tasks/{id}/pick", {
-      params: { path: { id: pending.id } },
+      params: { path: { id } },
     });
     if (error) {
       setError("Could not pick a task — try again.");
-      await refresh();
-      return;
     }
     await refresh();
   }
 
+  // Pick = the animation. The highlight cycles through the Pending Pool and
+  // decelerates onto a winner; the landed Task is what we commit (ADR-0002, the
+  // result emerges from the animation rather than being pre-decided).
+  //
+  // Fairness tuning: with a fixed start index, landing on `(start + steps) % n`
+  // is uniform across the Pool only if `steps` is drawn so every residue mod n
+  // is equally likely. We draw `steps` uniformly from a window of EXACTLY `n`
+  // consecutive values (one full extra lap past a guaranteed `baseLaps`), so
+  // each Pending task is ~equally likely to win. The ease-out deceleration is
+  // applied to step TIMING only and never to which index wins, so it can't bias
+  // the draw.
+  async function onPick() {
+    if (animatingRef.current) return;
+    setError(null);
+    const pendingTasks = tasks.filter((t) => t.status === "pending");
+    const n = pendingTasks.length;
+    if (n === 0) return;
+
+    animatingRef.current = true;
+    const start = 0;
+    const baseLaps = 2; // ensures a satisfying minimum of cycling before landing
+    const steps = baseLaps * n + Math.floor(Math.random() * n); // window of n values
+    const winnerIndex = (start + steps) % n;
+    const winner = pendingTasks[winnerIndex];
+
+    let index = start;
+    setHighlightIndex(index);
+    for (let i = 0; i < steps; i++) {
+      await new Promise((resolve) => setTimeout(resolve, stepDelay(i, steps)));
+      index = (index + 1) % n;
+      setHighlightIndex(index);
+    }
+
+    setHighlightIndex(null);
+    animatingRef.current = false;
+    await commitPick(winner.id);
+  }
+
   const inProgressCount = tasks.filter((t) => t.status === "in_progress").length;
   const pendingCount = tasks.filter((t) => t.status === "pending").length;
-  const pickDisabled = pendingCount === 0 || inProgressCount >= maxInProgress;
+  const animating = highlightIndex !== null;
+  const pickDisabled =
+    pendingCount === 0 || inProgressCount >= maxInProgress || animating;
+
+  // Maps a Pending task id to its index within the Pool, so a row can tell
+  // whether the cycling highlight is currently on it.
+  const pendingIndexById = new Map(
+    tasks.filter((t) => t.status === "pending").map((t, i) => [t.id, i]),
+  );
 
   return (
     <main style={{ maxWidth: 480, margin: "2rem auto", fontFamily: "sans-serif" }}>
@@ -84,7 +142,7 @@ export function App() {
       </form>
 
       <button onClick={onPick} disabled={pickDisabled} style={{ marginBottom: 16 }}>
-        Pick
+        {animating ? "Picking…" : "Pick"}
       </button>
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}
@@ -96,18 +154,28 @@ export function App() {
         <ul>
           {tasks.map((task) => {
             const inProgress = task.status === "in_progress";
+            const lit = pendingIndexById.get(task.id) === highlightIndex;
             return (
-              <li
+              <motion.li
                 key={task.id}
-                style={
-                  inProgress
-                    ? { background: "#fff3bf", padding: "2px 4px", borderRadius: 4 }
-                    : undefined
-                }
+                // The outdent: the lit row shifts right for physicality. A short
+                // spring snaps it in/out so each step has a tactile beat that
+                // rides the ease-out deceleration of the cycle.
+                animate={{ x: lit ? 16 : 0 }}
+                transition={{ type: "spring", stiffness: 700, damping: 30 }}
+                style={{
+                  padding: "2px 4px",
+                  borderRadius: 4,
+                  background: lit
+                    ? "#ffd43b"
+                    : inProgress
+                      ? "#fff3bf"
+                      : "transparent",
+                }}
               >
                 <strong>{task.title}</strong> <em>({task.status})</em>
                 {task.notes && <div>{task.notes}</div>}
-              </li>
+              </motion.li>
             );
           })}
         </ul>
