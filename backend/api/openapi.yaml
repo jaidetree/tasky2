@@ -102,8 +102,24 @@ components:
           description: Server-enforced limit on concurrent In Progress tasks
           format: int64
           type: integer
+        older_completed:
+          description: Tasks completed more than 24h ago, newest-first
+          items:
+            $ref: "#/components/schemas/TaskDTO"
+          type:
+            - array
+            - "null"
+        recently_completed:
+          description: Tasks completed within the last 24h (rolling), newest-first
+          items:
+            $ref: "#/components/schemas/TaskDTO"
+          type:
+            - array
+            - "null"
       required:
         - active
+        - recently_completed
+        - older_completed
         - max_in_progress
       type: object
     TaskDTO:
@@ -205,6 +221,35 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
       summary: Create a task
+      tags:
+        - tasks
+  /tasks/{id}/complete:
+    post:
+      description: Transition an In Progress task to Completed, stamping the completion time. Completed is terminal. Completing a task that is not In Progress is rejected with 409 Conflict.
+      operationId: completeTask
+      parameters:
+        - description: Identifier of the In-Progress task to complete
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Identifier of the In-Progress task to complete
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDTO"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Complete a task
       tags:
         - tasks
   /tasks/{id}/pick:

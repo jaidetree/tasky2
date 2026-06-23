@@ -55,15 +55,11 @@ func (s *Store) Create(ctx context.Context, title, notes string) (Task, error) {
 	return scanTask(row)
 }
 
-// ListActive returns the active pool — Pending + In Progress, soft-deleted rows
-// excluded — ordered by the manual position (id as a stable tiebreaker).
-func (s *Store) ListActive(ctx context.Context) ([]Task, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+taskColumns+` FROM tasks
-		 WHERE deleted_at IS NULL
-		   AND status IN ('pending', 'in_progress')
-		 ORDER BY position ASC, id ASC`,
-	)
+// queryTasks runs a multi-row task query and scans every row into a non-nil
+// (possibly empty) slice, so callers — and the clients beyond them — always see
+// a list rather than null.
+func (s *Store) queryTasks(ctx context.Context, sql string, args ...any) ([]Task, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +74,40 @@ func (s *Store) ListActive(ctx context.Context) ([]Task, error) {
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// ListActive returns the active pool — Pending + In Progress, soft-deleted rows
+// excluded — ordered by the manual position (id as a stable tiebreaker).
+func (s *Store) ListActive(ctx context.Context) ([]Task, error) {
+	return s.queryTasks(ctx,
+		`SELECT `+taskColumns+` FROM tasks
+		 WHERE deleted_at IS NULL
+		   AND status IN ('pending', 'in_progress')
+		 ORDER BY position ASC, id ASC`)
+}
+
+// ListRecentlyCompleted returns Tasks completed within the rolling 24h window
+// (completed_at > now() - 24h), newest-first, soft-deleted rows excluded. The
+// rolling boundary lives in SQL so it is exercised at the HTTP seam.
+func (s *Store) ListRecentlyCompleted(ctx context.Context) ([]Task, error) {
+	return s.queryTasks(ctx,
+		`SELECT `+taskColumns+` FROM tasks
+		 WHERE deleted_at IS NULL
+		   AND status = 'completed'
+		   AND completed_at > now() - interval '24 hours'
+		 ORDER BY completed_at DESC`)
+}
+
+// ListOlderCompleted returns Tasks completed before the rolling 24h window
+// (completed_at <= now() - 24h), newest-first, soft-deleted rows excluded —
+// the history shown behind the collapsed expand toggle.
+func (s *Store) ListOlderCompleted(ctx context.Context) ([]Task, error) {
+	return s.queryTasks(ctx,
+		`SELECT `+taskColumns+` FROM tasks
+		 WHERE deleted_at IS NULL
+		   AND status = 'completed'
+		   AND completed_at <= now() - interval '24 hours'
+		 ORDER BY completed_at DESC`)
 }
 
 // Pick atomically transitions a single Pending Task to In Progress, enforcing
@@ -102,6 +132,27 @@ func (s *Store) Pick(ctx context.Context, id int64, maxInProgress int) (Task, er
 	t, err := scanTask(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Task{}, ErrPickRejected
+	}
+	return t, err
+}
+
+// Complete atomically transitions a single In-Progress Task to Completed and
+// stamps completed_at. One guarded statement, mirroring Pick: the WHERE clause
+// requires the row to be In Progress and live, so the check and the write
+// cannot race. No qualifying row -> pgx.ErrNoRows -> ErrCompleteRejected.
+func (s *Store) Complete(ctx context.Context, id int64) (Task, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE tasks
+		    SET status = 'completed', completed_at = now()
+		  WHERE id = $1
+		    AND status = 'in_progress'
+		    AND deleted_at IS NULL
+		 RETURNING `+taskColumns,
+		id,
+	)
+	t, err := scanTask(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Task{}, ErrCompleteRejected
 	}
 	return t, err
 }

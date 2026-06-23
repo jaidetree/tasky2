@@ -20,10 +20,14 @@ function stepDelay(i: number, total: number): number {
 
 export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [recentlyCompleted, setRecentlyCompleted] = useState<Task[]>([]);
+  const [olderCompleted, setOlderCompleted] = useState<Task[]>([]);
   const [maxInProgress, setMaxInProgress] = useState(1);
   const [title, setTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Older completed history is collapsed by default (PRD: available, not in my face).
+  const [showOlder, setShowOlder] = useState(false);
   // Index (within the Pending Pool) currently lit by the cycling highlight, or
   // null when no animation is running.
   const [highlightIndex, setHighlightIndex] = useState<number | null>(null);
@@ -36,6 +40,8 @@ export function App() {
       return;
     }
     setTasks(data.active ?? []);
+    setRecentlyCompleted(data.recently_completed ?? []);
+    setOlderCompleted(data.older_completed ?? []);
     setMaxInProgress(data.max_in_progress);
   }
 
@@ -108,6 +114,19 @@ export function App() {
     await commitPick(winner.id);
   }
 
+  // Complete an In-Progress task. The server validates the transition (only
+  // In Progress → Completed); a rejection surfaces as the existing message.
+  async function onComplete(id: number) {
+    setError(null);
+    const { error } = await api.POST("/tasks/{id}/complete", {
+      params: { path: { id } },
+    });
+    if (error) {
+      setError("Could not complete the task — try again.");
+    }
+    await refresh();
+  }
+
   const inProgressCount = tasks.filter((t) => t.status === "in_progress").length;
   const pendingCount = tasks.filter((t) => t.status === "pending").length;
   const animating = highlightIndex !== null;
@@ -174,11 +193,42 @@ export function App() {
                 }}
               >
                 <strong>{task.title}</strong> <em>({task.status})</em>
+                {inProgress && (
+                  <button onClick={() => onComplete(task.id)} style={{ marginLeft: 8 }}>
+                    Complete
+                  </button>
+                )}
                 {task.notes && <div>{task.notes}</div>}
               </motion.li>
             );
           })}
         </ul>
+      )}
+
+      {recentlyCompleted.length > 0 && (
+        <>
+          <h2>Recently completed</h2>
+          <ul>
+            {recentlyCompleted.map((task) => (
+              <li key={task.id}>{task.title}</li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {olderCompleted.length > 0 && (
+        <section style={{ marginTop: 16 }}>
+          <button onClick={() => setShowOlder((v) => !v)}>
+            {showOlder ? "Hide" : "Show"} older completed ({olderCompleted.length})
+          </button>
+          {showOlder && (
+            <ul>
+              {olderCompleted.map((task) => (
+                <li key={task.id}>{task.title}</li>
+              ))}
+            </ul>
+          )}
+        </section>
       )}
     </main>
   );

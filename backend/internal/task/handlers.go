@@ -36,6 +36,16 @@ func toDTO(t Task) taskDTO {
 	}
 }
 
+// toDTOs maps a slice of domain Tasks to wire DTOs, always returning a non-nil
+// (possibly empty) slice so each list serialises as [] rather than null.
+func toDTOs(tasks []Task) []taskDTO {
+	out := make([]taskDTO, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, toDTO(t))
+	}
+	return out
+}
+
 // CreateTaskInput is the POST /tasks request body.
 type CreateTaskInput struct {
 	Body struct {
@@ -49,19 +59,27 @@ type TaskOutput struct {
 	Body taskDTO
 }
 
-// ListTasksOutput is the GET /tasks response: the active pool plus the
-// server-enforced In-Progress limit, so the frontend can disable Pick at the
-// limit without a second round-trip.
+// ListTasksOutput is the GET /tasks response: the active pool, the completed
+// Tasks split by the rolling 24h window (recently vs older, both newest-first),
+// and the server-enforced In-Progress limit, so the frontend can disable Pick
+// at the limit without a second round-trip.
 type ListTasksOutput struct {
 	Body struct {
-		Active        []taskDTO `json:"active" doc:"Active pool: Pending and In Progress tasks, manually ordered"`
-		MaxInProgress int       `json:"max_in_progress" doc:"Server-enforced limit on concurrent In Progress tasks"`
+		Active            []taskDTO `json:"active" doc:"Active pool: Pending and In Progress tasks, manually ordered"`
+		RecentlyCompleted []taskDTO `json:"recently_completed" doc:"Tasks completed within the last 24h (rolling), newest-first"`
+		OlderCompleted    []taskDTO `json:"older_completed" doc:"Tasks completed more than 24h ago, newest-first"`
+		MaxInProgress     int       `json:"max_in_progress" doc:"Server-enforced limit on concurrent In Progress tasks"`
 	}
 }
 
 // PickTaskInput is the POST /tasks/{id}/pick path-only request.
 type PickTaskInput struct {
 	ID int64 `path:"id" doc:"Identifier of the Pending task to pick"`
+}
+
+// CompleteTaskInput is the POST /tasks/{id}/complete path-only request.
+type CompleteTaskInput struct {
+	ID int64 `path:"id" doc:"Identifier of the In-Progress task to complete"`
 }
 
 // RegisterRoutes registers the task operations on the huma API. The handlers
@@ -94,15 +112,22 @@ func RegisterRoutes(api huma.API, svc *Service) {
 		Description: "Return the active pool: Pending and In Progress tasks, manually ordered.",
 		Tags:        []string{"tasks"},
 	}, func(ctx context.Context, _ *struct{}) (*ListTasksOutput, error) {
-		tasks, err := svc.ListActive(ctx)
+		active, err := svc.ListActive(ctx)
+		if err != nil {
+			return nil, huma.Error500InternalServerError("could not list tasks", err)
+		}
+		recent, err := svc.ListRecentlyCompleted(ctx)
+		if err != nil {
+			return nil, huma.Error500InternalServerError("could not list tasks", err)
+		}
+		older, err := svc.ListOlderCompleted(ctx)
 		if err != nil {
 			return nil, huma.Error500InternalServerError("could not list tasks", err)
 		}
 		out := &ListTasksOutput{}
-		out.Body.Active = make([]taskDTO, 0, len(tasks))
-		for _, t := range tasks {
-			out.Body.Active = append(out.Body.Active, toDTO(t))
-		}
+		out.Body.Active = toDTOs(active)
+		out.Body.RecentlyCompleted = toDTOs(recent)
+		out.Body.OlderCompleted = toDTOs(older)
 		out.Body.MaxInProgress = svc.MaxInProgress()
 		return out, nil
 	})
@@ -121,6 +146,24 @@ func RegisterRoutes(api huma.API, svc *Service) {
 				return nil, huma.Error409Conflict("task is not pending or the in-progress limit is reached")
 			}
 			return nil, huma.Error500InternalServerError("could not pick task", err)
+		}
+		return &TaskOutput{Body: toDTO(t)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "completeTask",
+		Method:      http.MethodPost,
+		Path:        "/tasks/{id}/complete",
+		Summary:     "Complete a task",
+		Description: "Transition an In Progress task to Completed, stamping the completion time. Completed is terminal. Completing a task that is not In Progress is rejected with 409 Conflict.",
+		Tags:        []string{"tasks"},
+	}, func(ctx context.Context, in *CompleteTaskInput) (*TaskOutput, error) {
+		t, err := svc.Complete(ctx, in.ID)
+		if err != nil {
+			if errors.Is(err, ErrCompleteRejected) {
+				return nil, huma.Error409Conflict("task is not in progress")
+			}
+			return nil, huma.Error500InternalServerError("could not complete task", err)
 		}
 		return &TaskOutput{Body: toDTO(t)}, nil
 	})

@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -136,17 +137,39 @@ func decode[T any](t *testing.T, resp *http.Response) T {
 }
 
 type taskResponse struct {
-	ID        int64  `json:"id"`
-	Title     string `json:"title"`
-	Notes     string `json:"notes"`
-	Status    string `json:"status"`
-	Position  int    `json:"position"`
-	CreatedAt string `json:"created_at"`
+	ID          int64   `json:"id"`
+	Title       string  `json:"title"`
+	Notes       string  `json:"notes"`
+	Status      string  `json:"status"`
+	Position    int     `json:"position"`
+	CreatedAt   string  `json:"created_at"`
+	CompletedAt *string `json:"completed_at"`
 }
 
 type listResponse struct {
-	Active        []taskResponse `json:"active"`
-	MaxInProgress int            `json:"max_in_progress"`
+	Active            []taskResponse `json:"active"`
+	RecentlyCompleted []taskResponse `json:"recently_completed"`
+	OlderCompleted    []taskResponse `json:"older_completed"`
+	MaxInProgress     int            `json:"max_in_progress"`
+}
+
+// containsID reports whether any task in the list has the given id.
+func containsID(tasks []taskResponse, id int64) bool {
+	for _, t := range tasks {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// idsOf returns the ids of a task list in order, for asserting ordering.
+func idsOf(tasks []taskResponse) []int64 {
+	ids := make([]int64, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	return ids
 }
 
 // statusOf reads the persisted status of a task directly from the DB, for
@@ -170,6 +193,21 @@ func (h *harness) seedTask(t *testing.T, title, status string, position int) int
 		`INSERT INTO tasks (title, status, position) VALUES ($1, $2, $3) RETURNING id`,
 		title, status, position).Scan(&id); err != nil {
 		t.Fatalf("seed %q: %v", title, err)
+	}
+	return id
+}
+
+// seedCompleted inserts a Completed task whose completed_at is `ago` before now
+// (a Postgres interval literal, e.g. "1 hour", "25 hours"), so the rolling-24h
+// split can be exercised across the boundary without waiting.
+func (h *harness) seedCompleted(t *testing.T, title, ago string) int64 {
+	t.Helper()
+	var id int64
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO tasks (title, status, completed_at)
+		 VALUES ($1, 'completed', now() - $2::interval) RETURNING id`,
+		title, ago).Scan(&id); err != nil {
+		t.Fatalf("seed completed %q: %v", title, err)
 	}
 	return id
 }
@@ -318,8 +356,8 @@ func TestListActiveFiltersAndOrders(t *testing.T) {
 	seed("second", "pending", 2, false, false)
 	seed("first", "pending", 1, false, false)
 	seed("third", "in_progress", 3, false, false)
-	seed("finished", "completed", 0, true, false)  // excluded: completed
-	seed("cancelled", "pending", 0, false, true)   // excluded: soft-deleted
+	seed("finished", "completed", 0, true, false) // excluded: completed
+	seed("cancelled", "pending", 0, false, true)  // excluded: soft-deleted
 
 	list := decode[listResponse](t, h.get(t, "/tasks"))
 
@@ -463,4 +501,113 @@ func TestPickNonPendingRejected(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- complete --------------------------------------------------------------
+
+func completePath(id int64) string {
+	return "/tasks/" + strconv.FormatInt(id, 10) + "/complete"
+}
+
+// Complete an In-Progress task → it becomes Completed with completed_at stamped
+// (response + DB), leaves the active list, and shows up in recently-completed.
+func TestCompleteInProgressBecomesCompleted(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "Wash the dishes", "in_progress", 1)
+
+	resp := h.post(t, completePath(id), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete status = %d, want 200", resp.StatusCode)
+	}
+	completed := decode[taskResponse](t, resp)
+	if completed.Status != "completed" {
+		t.Errorf("response status = %q, want completed", completed.Status)
+	}
+	if completed.CompletedAt == nil || *completed.CompletedAt == "" {
+		t.Errorf("response completed_at not stamped")
+	}
+
+	// DB: status completed and completed_at non-null.
+	var (
+		status      string
+		completedAt *time.Time
+	)
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT status, completed_at FROM tasks WHERE id = $1", id,
+	).Scan(&status, &completedAt); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if status != "completed" {
+		t.Errorf("persisted status = %q, want completed", status)
+	}
+	if completedAt == nil {
+		t.Errorf("persisted completed_at is NULL, want a timestamp")
+	}
+
+	// It leaves the active list and appears in recently-completed.
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	if containsID(list.Active, id) {
+		t.Errorf("completed task %d still in active list", id)
+	}
+	if !containsID(list.RecentlyCompleted, id) {
+		t.Errorf("completed task %d not in recently_completed", id)
+	}
+}
+
+// The rolling-24h split: tasks completed within the last 24h are in
+// recently_completed (newest-first); a task completed >24h ago falls out of
+// recently_completed and into older_completed.
+func TestCompletedRollingWindowSplit(t *testing.T) {
+	h := newHarness(t)
+	recentNew := h.seedCompleted(t, "an hour ago", "1 hour")
+	recentOld := h.seedCompleted(t, "three hours ago", "3 hours")
+	older := h.seedCompleted(t, "a day and an hour ago", "25 hours")
+
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+
+	// recently_completed holds both within-window tasks, newest-first.
+	if got, want := idsOf(list.RecentlyCompleted), []int64{recentNew, recentOld}; !equalIDs(got, want) {
+		t.Errorf("recently_completed = %v, want %v (newest-first)", got, want)
+	}
+	// older_completed holds the >24h task, and only it.
+	if got, want := idsOf(list.OlderCompleted), []int64{older}; !equalIDs(got, want) {
+		t.Errorf("older_completed = %v, want %v", got, want)
+	}
+	// The boundary: the >24h task must not leak into recently_completed.
+	if containsID(list.RecentlyCompleted, older) {
+		t.Errorf("task completed >24h ago leaked into recently_completed")
+	}
+}
+
+// Completing a task that is not In Progress (Pending or already Completed) is
+// rejected with 409 (a client toast, not a 500) and leaves state unchanged.
+func TestCompleteNonInProgressRejected(t *testing.T) {
+	for _, status := range []string{"pending", "completed"} {
+		t.Run(status, func(t *testing.T) {
+			h := newHarness(t)
+			id := h.seedTask(t, "not in progress", status, 1)
+
+			resp := h.post(t, completePath(id), nil)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("complete status = %d, want 409", resp.StatusCode)
+			}
+			resp.Body.Close()
+			if got := h.statusOf(t, id); got != status {
+				t.Errorf("persisted status = %q, want %q (no state change)", got, status)
+			}
+		})
+	}
+}
+
+// equalIDs reports whether two id slices are equal in order.
+func equalIDs(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

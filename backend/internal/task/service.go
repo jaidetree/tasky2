@@ -17,6 +17,11 @@ var ErrTitleRequired = errors.New("title is required")
 // state; the API maps this to a client-visible toast, not a 500 (ADR-0002).
 var ErrPickRejected = errors.New("pick rejected: task is not pending or the in-progress limit is reached")
 
+// ErrCompleteRejected is returned when a Complete matches no eligible row: the
+// Task is not In Progress (still Pending, already Completed, or cancelled).
+// Completed is terminal. The API maps this to a client-visible toast, not a 500.
+var ErrCompleteRejected = errors.New("complete rejected: task is not in progress")
+
 // Service holds the Task lifecycle rules. It sits between the HTTP handlers and
 // the Store. maxInProgress is the configurable concurrency limit (default 1,
 // scales to 3) enforced server-side; it is unused until the Pick slice but is
@@ -47,6 +52,18 @@ func (s *Service) ListActive(ctx context.Context) ([]Task, error) {
 	return s.store.ListActive(ctx)
 }
 
+// ListRecentlyCompleted returns Tasks completed within the rolling 24h window,
+// newest-first — shown below the active list.
+func (s *Service) ListRecentlyCompleted(ctx context.Context) ([]Task, error) {
+	return s.store.ListRecentlyCompleted(ctx)
+}
+
+// ListOlderCompleted returns Tasks completed before the rolling 24h window,
+// newest-first — the history behind the collapsed expand toggle.
+func (s *Service) ListOlderCompleted(ctx context.Context) ([]Task, error) {
+	return s.store.ListOlderCompleted(ctx)
+}
+
 // MaxInProgress is the configurable concurrency limit, exposed so the API can
 // report it to the frontend (which disables the Pick control at the limit).
 func (s *Service) MaxInProgress() int {
@@ -63,4 +80,11 @@ func (s *Service) Pick(ctx context.Context, id int64) (Task, error) {
 		return Task{}, ErrPickRejected
 	}
 	return t, err
+}
+
+// Complete transitions an In-Progress Task to Completed and stamps the
+// completion time, validated server-side in one statement. If the Task is not
+// In Progress it returns ErrCompleteRejected (mapped by the API to a toast).
+func (s *Service) Complete(ctx context.Context, id int64) (Task, error) {
+	return s.store.Complete(ctx, id)
 }
