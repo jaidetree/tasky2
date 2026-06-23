@@ -116,6 +116,24 @@ func (h *harness) post(t *testing.T, path string, body any) *http.Response {
 	return resp
 }
 
+func (h *harness) patch(t *testing.T, path string, body any) *http.Response {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, h.baseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("build PATCH %s: %v", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", path, err)
+	}
+	return resp
+}
+
 func (h *harness) get(t *testing.T, path string) *http.Response {
 	t.Helper()
 	resp, err := h.client.Get(h.baseURL + path)
@@ -738,6 +756,211 @@ func TestCancelMissingOrAlreadyCancelledRejected(t *testing.T) {
 
 	if got := h.deletedAtOf(t, id); got == nil || !got.Equal(*firstStamp) {
 		t.Errorf("deleted_at changed on rejected re-cancel: got %v, want %v", got, firstStamp)
+	}
+}
+
+// --- edit ------------------------------------------------------------------
+
+func editPath(id int64) string {
+	return "/tasks/" + strconv.FormatInt(id, 10)
+}
+
+// titleNotesOf reads the persisted title/notes directly from the DB, for
+// asserting an edit landed (or that a rejected edit changed nothing).
+func (h *harness) titleNotesOf(t *testing.T, id int64) (string, string) {
+	t.Helper()
+	var title, notes string
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT title, notes FROM tasks WHERE id = $1", id).Scan(&title, &notes); err != nil {
+		t.Fatalf("read title/notes of task %d: %v", id, err)
+	}
+	return title, notes
+}
+
+// Edit a Pending task's title+notes → 200, both fields updated in response and
+// DB, status still pending.
+func TestEditPendingUpdatesTitleNotes(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "old title", "pending", 1)
+
+	resp := h.patch(t, editPath(id), map[string]string{
+		"title": "new title",
+		"notes": "new notes",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("edit status = %d, want 200", resp.StatusCode)
+	}
+	edited := decode[taskResponse](t, resp)
+	if edited.Title != "new title" || edited.Notes != "new notes" {
+		t.Errorf("response = (%q, %q), want (new title, new notes)", edited.Title, edited.Notes)
+	}
+	if edited.Status != "pending" {
+		t.Errorf("response status = %q, want pending", edited.Status)
+	}
+
+	title, notes := h.titleNotesOf(t, id)
+	if title != "new title" || notes != "new notes" {
+		t.Errorf("persisted = (%q, %q), want (new title, new notes)", title, notes)
+	}
+	if got := h.statusOf(t, id); got != "pending" {
+		t.Errorf("persisted status = %q, want pending", got)
+	}
+}
+
+// Edit an In-Progress task → 200, DB updated, status still in_progress.
+func TestEditInProgressKeepsStatus(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "old", "in_progress", 1)
+
+	resp := h.patch(t, editPath(id), map[string]string{
+		"title": "edited",
+		"notes": "edited notes",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("edit status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	title, notes := h.titleNotesOf(t, id)
+	if title != "edited" || notes != "edited notes" {
+		t.Errorf("persisted = (%q, %q), want (edited, edited notes)", title, notes)
+	}
+	if got := h.statusOf(t, id); got != "in_progress" {
+		t.Errorf("persisted status = %q, want in_progress", got)
+	}
+}
+
+// Edit a Completed task → 200, DB updated, status still completed AND
+// completed_at unchanged (edit owns only title/notes, never lifecycle fields).
+func TestEditCompletedKeepsCompletedAt(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedCompleted(t, "old", "1 hour")
+
+	var beforeStamp time.Time
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT completed_at FROM tasks WHERE id = $1", id).Scan(&beforeStamp); err != nil {
+		t.Fatalf("read completed_at: %v", err)
+	}
+
+	resp := h.patch(t, editPath(id), map[string]string{
+		"title": "edited",
+		"notes": "edited notes",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("edit status = %d, want 200", resp.StatusCode)
+	}
+	edited := decode[taskResponse](t, resp)
+	if edited.Status != "completed" {
+		t.Errorf("response status = %q, want completed", edited.Status)
+	}
+
+	title, notes := h.titleNotesOf(t, id)
+	if title != "edited" || notes != "edited notes" {
+		t.Errorf("persisted = (%q, %q), want (edited, edited notes)", title, notes)
+	}
+	if got := h.statusOf(t, id); got != "completed" {
+		t.Errorf("persisted status = %q, want completed", got)
+	}
+
+	var afterStamp time.Time
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT completed_at FROM tasks WHERE id = $1", id).Scan(&afterStamp); err != nil {
+		t.Fatalf("read completed_at after edit: %v", err)
+	}
+	if !afterStamp.Equal(beforeStamp) {
+		t.Errorf("completed_at changed on edit: got %v, want %v", afterStamp, beforeStamp)
+	}
+}
+
+// Partial edit: sending only notes leaves the title unchanged, and vice-versa.
+func TestEditPartialLeavesOtherFieldUnchanged(t *testing.T) {
+	h := newHarness(t)
+
+	// Notes only → title unchanged.
+	id := h.seedTask(t, "keep title", "pending", 1)
+	if _, err := h.pool.Exec(context.Background(),
+		"UPDATE tasks SET notes = 'old notes' WHERE id = $1", id); err != nil {
+		t.Fatalf("seed notes: %v", err)
+	}
+	resp := h.patch(t, editPath(id), map[string]string{"notes": "only notes changed"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("notes-only edit status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	title, notes := h.titleNotesOf(t, id)
+	if title != "keep title" {
+		t.Errorf("title = %q, want unchanged (keep title)", title)
+	}
+	if notes != "only notes changed" {
+		t.Errorf("notes = %q, want only notes changed", notes)
+	}
+
+	// Title only → notes unchanged.
+	id2 := h.seedTask(t, "old title", "pending", 2)
+	if _, err := h.pool.Exec(context.Background(),
+		"UPDATE tasks SET notes = 'keep notes' WHERE id = $1", id2); err != nil {
+		t.Fatalf("seed notes: %v", err)
+	}
+	resp = h.patch(t, editPath(id2), map[string]string{"title": "only title changed"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("title-only edit status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	title, notes = h.titleNotesOf(t, id2)
+	if title != "only title changed" {
+		t.Errorf("title = %q, want only title changed", title)
+	}
+	if notes != "keep notes" {
+		t.Errorf("notes = %q, want unchanged (keep notes)", notes)
+	}
+}
+
+// A whitespace-only title is rejected with 422 (trims to empty, mirroring
+// Create), and nothing is persisted.
+func TestEditBlankTitleRejected(t *testing.T) {
+	h := newHarness(t)
+	id := h.seedTask(t, "keep me", "pending", 1)
+
+	resp := h.patch(t, editPath(id), map[string]string{"title": "   "})
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("edit status = %d, want 422", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	title, _ := h.titleNotesOf(t, id)
+	if title != "keep me" {
+		t.Errorf("title = %q, want unchanged (keep me)", title)
+	}
+}
+
+// Edit of a missing id → 404; edit of a cancelled (soft-deleted) task → 404 with
+// its row unchanged.
+func TestEditMissingOrCancelledRejected(t *testing.T) {
+	h := newHarness(t)
+
+	// Missing id → 404.
+	resp := h.patch(t, editPath(999), map[string]string{"title": "x"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("edit of missing id status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Cancelled task → 404, row unchanged.
+	id := h.seedTask(t, "original", "pending", 1)
+	if r := h.del(t, cancelPath(id)); r.StatusCode != http.StatusOK {
+		t.Fatalf("setup cancel status = %d, want 200", r.StatusCode)
+	} else {
+		r.Body.Close()
+	}
+
+	resp = h.patch(t, editPath(id), map[string]string{"title": "should not apply"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("edit of cancelled status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if title, _ := h.titleNotesOf(t, id); title != "original" {
+		t.Errorf("title = %q, want unchanged (original)", title)
 	}
 }
 

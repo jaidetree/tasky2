@@ -87,6 +87,17 @@ type CancelTaskInput struct {
 	ID int64 `path:"id" doc:"Identifier of the task to cancel (soft delete)"`
 }
 
+// EditTaskInput is the PATCH /tasks/{id} request: a partial update of title
+// and/or notes. Both fields are optional pointers — an omitted field means
+// "leave unchanged". Lifecycle fields are not part of the edit contract.
+type EditTaskInput struct {
+	ID   int64 `path:"id" doc:"Identifier of the task to edit"`
+	Body struct {
+		Title *string `json:"title,omitempty" minLength:"1" maxLength:"200" doc:"New title (omit to leave unchanged)"`
+		Notes *string `json:"notes,omitempty" maxLength:"2000" doc:"New notes (omit to leave unchanged; empty string clears notes)"`
+	}
+}
+
 // RegisterRoutes registers the task operations on the huma API. The handlers
 // are the source of truth from which the OpenAPI spec is generated (ADR-0003).
 func RegisterRoutes(api huma.API, svc *Service) {
@@ -187,6 +198,27 @@ func RegisterRoutes(api huma.API, svc *Service) {
 				return nil, huma.Error404NotFound("task is missing or already cancelled")
 			}
 			return nil, huma.Error500InternalServerError("could not cancel task", err)
+		}
+		return &TaskOutput{Body: toDTO(t)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "editTask",
+		Method:      http.MethodPatch,
+		Path:        "/tasks/{id}",
+		Summary:     "Edit a task",
+		Description: "Update a task's title and/or notes (partial update), allowed in any status — Pending, In Progress, or Completed. Lifecycle fields (status, completion, cancellation) are not part of this contract. Editing a missing or cancelled task is rejected with 404 Not Found.",
+		Tags:        []string{"tasks"},
+	}, func(ctx context.Context, in *EditTaskInput) (*TaskOutput, error) {
+		t, err := svc.Edit(ctx, in.ID, in.Body.Title, in.Body.Notes)
+		if err != nil {
+			if errors.Is(err, ErrTitleRequired) {
+				return nil, huma.Error422UnprocessableEntity("title is required")
+			}
+			if errors.Is(err, ErrTaskNotFound) {
+				return nil, huma.Error404NotFound("task not found")
+			}
+			return nil, huma.Error500InternalServerError("could not edit task", err)
 		}
 		return &TaskOutput{Body: toDTO(t)}, nil
 	})

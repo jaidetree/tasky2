@@ -176,3 +176,26 @@ func (s *Store) Cancel(ctx context.Context, id int64) (Task, error) {
 	}
 	return t, err
 }
+
+// Edit atomically updates a Task's title and/or notes in one guarded statement,
+// reusing the COALESCE trick so a nil pointer ($2/$3) leaves that field
+// unchanged while an explicit empty-string notes clears notes. Lifecycle fields
+// are untouched, so editing works in any status. The WHERE clause requires the
+// row to still be live; a missing or cancelled row matches nothing ->
+// pgx.ErrNoRows -> ErrTaskNotFound.
+func (s *Store) Edit(ctx context.Context, id int64, title, notes *string) (Task, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE tasks
+		    SET title = COALESCE($2, title),
+		        notes = COALESCE($3, notes)
+		  WHERE id = $1
+		    AND deleted_at IS NULL
+		 RETURNING `+taskColumns,
+		id, title, notes,
+	)
+	t, err := scanTask(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Task{}, ErrTaskNotFound
+	}
+	return t, err
+}

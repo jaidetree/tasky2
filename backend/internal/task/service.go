@@ -28,6 +28,12 @@ var ErrCompleteRejected = errors.New("complete rejected: task is not in progress
 // API maps this to a 404 Not Found, not a 500.
 var ErrCancelRejected = errors.New("cancel rejected: task is missing or already cancelled")
 
+// ErrTaskNotFound is returned when an Edit matches no live row: the Task is
+// missing or cancelled (soft-deleted). Editing title/notes is allowed in any
+// status, so the only rejection is "no live row". The API maps this to a 404
+// Not Found, not a 500.
+var ErrTaskNotFound = errors.New("task not found")
+
 // Service holds the Task lifecycle rules. It sits between the HTTP handlers and
 // the Store. maxInProgress is the configurable concurrency limit (default 1,
 // scales to 3) enforced server-side; it is unused until the Pick slice but is
@@ -101,4 +107,21 @@ func (s *Service) Complete(ctx context.Context, id int64) (Task, error) {
 // ErrCancelRejected (mapped by the API to a 404).
 func (s *Service) Cancel(ctx context.Context, id int64) (Task, error) {
 	return s.store.Cancel(ctx, id)
+}
+
+// Edit updates a Task's title and/or notes, allowed in any status (lifecycle
+// fields stay owned by Pick/Complete/Cancel). title and notes are optional: a
+// nil pointer leaves that field unchanged. A non-nil title is trimmed and, if
+// blank, rejected with ErrTitleRequired (mirroring Create's guard). The Store
+// then applies a single guarded UPDATE; a missing or cancelled row returns
+// ErrTaskNotFound.
+func (s *Service) Edit(ctx context.Context, id int64, title, notes *string) (Task, error) {
+	if title != nil {
+		trimmed := strings.TrimSpace(*title)
+		if trimmed == "" {
+			return Task{}, ErrTitleRequired
+		}
+		title = &trimmed
+	}
+	return s.store.Edit(ctx, id, title, notes)
 }

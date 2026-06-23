@@ -32,6 +32,11 @@ export function App() {
   // null when no animation is running.
   const [highlightIndex, setHighlightIndex] = useState<number | null>(null);
   const animatingRef = useRef(false);
+  // Inline edit: the id of the row being edited (null = none), plus the draft
+  // title/notes. Edit is allowed in any status, so this drives every list.
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftNotes, setDraftNotes] = useState("");
 
   async function refresh() {
     const { data, error } = await api.GET("/tasks");
@@ -140,6 +145,60 @@ export function App() {
     await refresh();
   }
 
+  // Begin editing a row: stash its current title/notes as the draft.
+  function startEdit(task: Task) {
+    setError(null);
+    setEditingId(task.id);
+    setDraftTitle(task.title);
+    setDraftNotes(task.notes ?? "");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+  }
+
+  // Save the inline edit via PATCH (partial update of title/notes), then refresh.
+  // The server allows edits in any status; a rejection surfaces as the message.
+  async function saveEdit(id: number) {
+    setError(null);
+    const { error } = await api.PATCH("/tasks/{id}", {
+      params: { path: { id } },
+      body: { title: draftTitle, notes: draftNotes },
+    });
+    if (error) {
+      setError("Could not save the edit — try again.");
+      return;
+    }
+    setEditingId(null);
+    await refresh();
+  }
+
+  // Reusable inline edit form, shown on any row across all three lists.
+  function editForm(id: number) {
+    return (
+      <div style={{ display: "grid", gap: 4, marginTop: 4 }}>
+        <input
+          value={draftTitle}
+          onChange={(e) => setDraftTitle(e.target.value)}
+          placeholder="Title"
+        />
+        <textarea
+          value={draftNotes}
+          onChange={(e) => setDraftNotes(e.target.value)}
+          placeholder="Notes (optional)"
+        />
+        <div>
+          <button onClick={() => saveEdit(id)} disabled={!draftTitle.trim()}>
+            Save
+          </button>
+          <button onClick={cancelEdit} style={{ marginLeft: 8 }}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const inProgressCount = tasks.filter((t) => t.status === "in_progress").length;
   const pendingCount = tasks.filter((t) => t.status === "pending").length;
   const animating = highlightIndex !== null;
@@ -211,10 +270,13 @@ export function App() {
                     Complete
                   </button>
                 )}
+                <button onClick={() => startEdit(task)} style={{ marginLeft: 8 }}>
+                  Edit
+                </button>
                 <button onClick={() => onCancel(task.id)} style={{ marginLeft: 8 }}>
                   Cancel
                 </button>
-                {task.notes && <div>{task.notes}</div>}
+                {editingId === task.id ? editForm(task.id) : task.notes && <div>{task.notes}</div>}
               </motion.li>
             );
           })}
@@ -226,7 +288,13 @@ export function App() {
           <h2>Recently completed</h2>
           <ul>
             {recentlyCompleted.map((task) => (
-              <li key={task.id}>{task.title}</li>
+              <li key={task.id}>
+                {task.title}
+                <button onClick={() => startEdit(task)} style={{ marginLeft: 8 }}>
+                  Edit
+                </button>
+                {editingId === task.id && editForm(task.id)}
+              </li>
             ))}
           </ul>
         </>
@@ -240,7 +308,13 @@ export function App() {
           {showOlder && (
             <ul>
               {olderCompleted.map((task) => (
-                <li key={task.id}>{task.title}</li>
+                <li key={task.id}>
+                  {task.title}
+                  <button onClick={() => startEdit(task)} style={{ marginLeft: 8 }}>
+                    Edit
+                  </button>
+                  {editingId === task.id && editForm(task.id)}
+                </li>
               ))}
             </ul>
           )}

@@ -22,6 +22,26 @@ components:
       required:
         - title
       type: object
+    EditTaskInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/schemas/EditTaskInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        notes:
+          description: New notes (omit to leave unchanged; empty string clears notes)
+          maxLength: 2000
+          type: string
+        title:
+          description: New title (omit to leave unchanged)
+          maxLength: 200
+          minLength: 1
+          type: string
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -250,6 +270,40 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
       summary: Cancel a task
+      tags:
+        - tasks
+    patch:
+      description: Update a task's title and/or notes (partial update), allowed in any status — Pending, In Progress, or Completed. Lifecycle fields (status, completion, cancellation) are not part of this contract. Editing a missing or cancelled task is rejected with 404 Not Found.
+      operationId: editTask
+      parameters:
+        - description: Identifier of the task to edit
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Identifier of the task to edit
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EditTaskInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDTO"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Edit a task
       tags:
         - tasks
   /tasks/{id}/complete:
