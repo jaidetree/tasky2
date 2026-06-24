@@ -151,17 +151,21 @@ export function App() {
   }
 
   // Persist a manual reorder. Reorder updates `tasks` optimistically as the row
-  // is dragged; on drop we diff against the order the server last gave us and, if
-  // a single task moved, issue ONE move to its new index, then refresh so the
-  // server's renumbered positions are the source of truth.
-  async function commitReorder(order: Task[]) {
+  // is dragged; on drop the dragged row tells us exactly which task moved (its
+  // own id), so we send that task to its settled index. Using the dragged id —
+  // rather than diffing for the first changed slot — is correct in BOTH
+  // directions: a downward drag vacates a slot that the shifted-up neighbour
+  // fills, so a first-difference heuristic would mis-identify the move and only
+  // nudge it one place. Skip the request when the order is unchanged.
+  async function commitReorder(movedId: number, order: Task[]) {
     const before = orderRef.current.map((t) => t.id);
     const after = order.map((t) => t.id);
-    const moved = after.find((id, i) => id !== before[i]);
-    if (moved === undefined) return; // order unchanged → no request
-    const position = after.indexOf(moved);
+    if (before.length === after.length && before.every((id, i) => id === after[i])) {
+      return; // order unchanged → no request
+    }
+    const position = after.indexOf(movedId);
     const { error } = await api.POST("/tasks/{id}/move", {
-      params: { path: { id: moved } },
+      params: { path: { id: movedId } },
       body: { position },
     });
     if (error) {
@@ -282,7 +286,7 @@ export function App() {
                 value={task}
                 // Drag-to-reorder updates `tasks` live; on drop we persist the
                 // settled order with a single move (only if it actually changed).
-                onDragEnd={() => commitReorder(tasks)}
+                onDragEnd={() => commitReorder(task.id, tasks)}
                 // The Pick outdent: the lit row shifts right for physicality. A
                 // short spring snaps it in/out so each step has a tactile beat
                 // that rides the ease-out deceleration of the cycle.
