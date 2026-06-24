@@ -98,6 +98,15 @@ type EditTaskInput struct {
 	}
 }
 
+// MoveTaskInput is the POST /tasks/{id}/move request: the desired 0-based index
+// of the task within the active ordering (active = Pending + In Progress).
+type MoveTaskInput struct {
+	ID   int64 `path:"id" doc:"Identifier of the active task to move"`
+	Body struct {
+		Position int `json:"position" minimum:"0" doc:"Desired 0-based index within the active ordering"`
+	}
+}
+
 // RegisterRoutes registers the task operations on the huma API. The handlers
 // are the source of truth from which the OpenAPI spec is generated (ADR-0003).
 func RegisterRoutes(api huma.API, svc *Service) {
@@ -219,6 +228,24 @@ func RegisterRoutes(api huma.API, svc *Service) {
 				return nil, huma.Error404NotFound("task not found")
 			}
 			return nil, huma.Error500InternalServerError("could not edit task", err)
+		}
+		return &TaskOutput{Body: toDTO(t)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "moveTask",
+		Method:      http.MethodPost,
+		Path:        "/tasks/{id}/move",
+		Summary:     "Move a task",
+		Description: "Move a live active task (Pending or In Progress) to a 0-based index within the active ordering, renumbering the whole active set to contiguous positions in one transaction. The position is clamped to the bounds of the active list, so an out-of-range index lands the task last. Moving a task that is missing, completed, or cancelled is rejected with 404 Not Found.",
+		Tags:        []string{"tasks"},
+	}, func(ctx context.Context, in *MoveTaskInput) (*TaskOutput, error) {
+		t, err := svc.Move(ctx, in.ID, in.Body.Position)
+		if err != nil {
+			if errors.Is(err, ErrMoveRejected) {
+				return nil, huma.Error404NotFound("task is not a live active task")
+			}
+			return nil, huma.Error500InternalServerError("could not move task", err)
 		}
 		return &TaskOutput{Body: toDTO(t)}, nil
 	})

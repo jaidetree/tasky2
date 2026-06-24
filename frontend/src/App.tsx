@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { motion } from "motion/react";
+import { Reorder } from "motion/react";
 import { api, type Task } from "./api/client";
 
 // Disposable prototype UI: create a task, see the active pool, and Pick a
@@ -32,6 +32,9 @@ export function App() {
   // null when no animation is running.
   const [highlightIndex, setHighlightIndex] = useState<number | null>(null);
   const animatingRef = useRef(false);
+  // The active order as the server last gave it, so a drag-drop can diff the
+  // settled order against the pre-drag baseline (Reorder mutates `tasks` live).
+  const orderRef = useRef<Task[]>([]);
   // Inline edit: the id of the row being edited (null = none), plus the draft
   // title/notes. Edit is allowed in any status, so this drives every list.
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -44,7 +47,9 @@ export function App() {
       setError("Could not load tasks");
       return;
     }
-    setTasks(data.active ?? []);
+    const active = data.active ?? [];
+    setTasks(active);
+    orderRef.current = active;
     setRecentlyCompleted(data.recently_completed ?? []);
     setOlderCompleted(data.older_completed ?? []);
     setMaxInProgress(data.max_in_progress);
@@ -141,6 +146,26 @@ export function App() {
     });
     if (error) {
       setError("Could not cancel the task — try again.");
+    }
+    await refresh();
+  }
+
+  // Persist a manual reorder. Reorder updates `tasks` optimistically as the row
+  // is dragged; on drop we diff against the order the server last gave us and, if
+  // a single task moved, issue ONE move to its new index, then refresh so the
+  // server's renumbered positions are the source of truth.
+  async function commitReorder(order: Task[]) {
+    const before = orderRef.current.map((t) => t.id);
+    const after = order.map((t) => t.id);
+    const moved = after.find((id, i) => id !== before[i]);
+    if (moved === undefined) return; // order unchanged → no request
+    const position = after.indexOf(moved);
+    const { error } = await api.POST("/tasks/{id}/move", {
+      params: { path: { id: moved } },
+      body: { position },
+    });
+    if (error) {
+      setError("Could not move the task — try again.");
     }
     await refresh();
   }
@@ -242,21 +267,31 @@ export function App() {
       {tasks.length === 0 ? (
         <p>No tasks yet.</p>
       ) : (
-        <ul>
+        <Reorder.Group
+          axis="y"
+          values={tasks}
+          onReorder={setTasks}
+          style={{ listStyle: "none", padding: 0 }}
+        >
           {tasks.map((task) => {
             const inProgress = task.status === "in_progress";
             const lit = pendingIndexById.get(task.id) === highlightIndex;
             return (
-              <motion.li
+              <Reorder.Item
                 key={task.id}
-                // The outdent: the lit row shifts right for physicality. A short
-                // spring snaps it in/out so each step has a tactile beat that
-                // rides the ease-out deceleration of the cycle.
+                value={task}
+                // Drag-to-reorder updates `tasks` live; on drop we persist the
+                // settled order with a single move (only if it actually changed).
+                onDragEnd={() => commitReorder(tasks)}
+                // The Pick outdent: the lit row shifts right for physicality. A
+                // short spring snaps it in/out so each step has a tactile beat
+                // that rides the ease-out deceleration of the cycle.
                 animate={{ x: lit ? 16 : 0 }}
                 transition={{ type: "spring", stiffness: 700, damping: 30 }}
                 style={{
                   padding: "2px 4px",
                   borderRadius: 4,
+                  cursor: "grab",
                   background: lit
                     ? "#ffd43b"
                     : inProgress
@@ -277,10 +312,10 @@ export function App() {
                   Cancel
                 </button>
                 {editingId === task.id ? editForm(task.id) : task.notes && <div>{task.notes}</div>}
-              </motion.li>
+              </Reorder.Item>
             );
           })}
-        </ul>
+        </Reorder.Group>
       )}
 
       {recentlyCompleted.length > 0 && (

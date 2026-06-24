@@ -964,6 +964,196 @@ func TestEditMissingOrCancelledRejected(t *testing.T) {
 	}
 }
 
+// --- move ------------------------------------------------------------------
+
+func movePath(id int64) string {
+	return "/tasks/" + strconv.FormatInt(id, 10) + "/move"
+}
+
+// positionsOf reads the persisted position of each given task id directly from
+// the DB, in the order requested, for asserting the renumber landed.
+func (h *harness) positionsOf(t *testing.T, ids []int64) []int {
+	t.Helper()
+	out := make([]int, len(ids))
+	for i, id := range ids {
+		var pos int
+		if err := h.pool.QueryRow(context.Background(),
+			"SELECT position FROM tasks WHERE id = $1", id).Scan(&pos); err != nil {
+			t.Fatalf("read position of task %d: %v", id, err)
+		}
+		out[i] = pos
+	}
+	return out
+}
+
+// activeIDs fetches the current active ordering via GET /tasks.
+func (h *harness) activeIDs(t *testing.T) []int64 {
+	t.Helper()
+	list := decode[listResponse](t, h.get(t, "/tasks"))
+	return idsOf(list.Active)
+}
+
+// Move a task from the end of the active list to index 0 → it leads, the rest
+// keep their prior relative order, and the persisted positions are contiguous
+// 0..n-1.
+func TestMoveToFrontReorders(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	b := h.seedTask(t, "b", "pending", 1)
+	c := h.seedTask(t, "c", "pending", 2)
+	d := h.seedTask(t, "d", "pending", 3)
+
+	resp := h.post(t, movePath(d), map[string]int{"position": 0})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200", resp.StatusCode)
+	}
+	moved := decode[taskResponse](t, resp)
+	if moved.ID != d {
+		t.Errorf("moved id = %d, want %d", moved.ID, d)
+	}
+
+	if got, want := h.activeIDs(t), []int64{d, a, b, c}; !equalIDs(got, want) {
+		t.Errorf("active order = %v, want %v", got, want)
+	}
+	// Positions contiguous 0..n-1 in the new order.
+	if got, want := h.positionsOf(t, []int64{d, a, b, c}), []int{0, 1, 2, 3}; !equalInts(got, want) {
+		t.Errorf("positions = %v, want %v", got, want)
+	}
+}
+
+// Move a task to a middle index → the resulting order is correct.
+func TestMoveToMiddleReorders(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	b := h.seedTask(t, "b", "pending", 1)
+	c := h.seedTask(t, "c", "pending", 2)
+	d := h.seedTask(t, "d", "pending", 3)
+
+	// Move a to index 2: remaining [b,c,d], splice a at 2 → [b,c,a,d].
+	resp := h.post(t, movePath(a), map[string]int{"position": 2})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if got, want := h.activeIDs(t), []int64{b, c, a, d}; !equalIDs(got, want) {
+		t.Errorf("active order = %v, want %v", got, want)
+	}
+}
+
+// A position far beyond the end is clamped: the task ends up last, no error.
+func TestMoveClampsBeyondEnd(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	b := h.seedTask(t, "b", "pending", 1)
+	c := h.seedTask(t, "c", "pending", 2)
+
+	resp := h.post(t, movePath(a), map[string]int{"position": 999})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if got, want := h.activeIDs(t), []int64{b, c, a}; !equalIDs(got, want) {
+		t.Errorf("active order = %v, want %v", got, want)
+	}
+}
+
+// An In-Progress task participates in the renumber: moving produces a correct
+// combined active order and the in-progress row is renumbered too.
+func TestMoveIncludesInProgress(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	prog := h.seedTask(t, "in progress", "in_progress", 1)
+	c := h.seedTask(t, "c", "pending", 2)
+
+	// Move c to index 0 → [c, a, prog].
+	resp := h.post(t, movePath(c), map[string]int{"position": 0})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if got, want := h.activeIDs(t), []int64{c, a, prog}; !equalIDs(got, want) {
+		t.Errorf("active order = %v, want %v", got, want)
+	}
+	// The in-progress row got a fresh contiguous position (it is last → 2).
+	if got, want := h.positionsOf(t, []int64{c, a, prog}), []int{0, 1, 2}; !equalInts(got, want) {
+		t.Errorf("positions = %v, want %v", got, want)
+	}
+}
+
+// Persistence: after a move, a second independent GET returns the same order.
+func TestMovePersists(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	b := h.seedTask(t, "b", "pending", 1)
+	c := h.seedTask(t, "c", "pending", 2)
+
+	resp := h.post(t, movePath(c), map[string]int{"position": 0})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// First read.
+	if got, want := h.activeIDs(t), []int64{c, a, b}; !equalIDs(got, want) {
+		t.Fatalf("active order = %v, want %v", got, want)
+	}
+	// A second, independent read sees the same persisted order.
+	if got, want := h.activeIDs(t), []int64{c, a, b}; !equalIDs(got, want) {
+		t.Errorf("second read active order = %v, want %v", got, want)
+	}
+}
+
+// Moving a non-active id → 404, leaving other rows' positions unchanged. Covers
+// a missing id, a completed task, and a cancelled task.
+func TestMoveNonActiveRejected(t *testing.T) {
+	h := newHarness(t)
+	a := h.seedTask(t, "a", "pending", 0)
+	b := h.seedTask(t, "b", "pending", 1)
+	completed := h.seedTask(t, "done", "completed", 5)
+	cancelled := h.seedTask(t, "gone", "pending", 6)
+	if r := h.del(t, cancelPath(cancelled)); r.StatusCode != http.StatusOK {
+		t.Fatalf("setup cancel status = %d, want 200", r.StatusCode)
+	} else {
+		r.Body.Close()
+	}
+
+	before := h.positionsOf(t, []int64{a, b})
+
+	for name, id := range map[string]int64{
+		"missing":   999,
+		"completed": completed,
+		"cancelled": cancelled,
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := h.post(t, movePath(id), map[string]int{"position": 0})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("move %s status = %d, want 404", name, resp.StatusCode)
+			}
+			resp.Body.Close()
+
+			if got := h.positionsOf(t, []int64{a, b}); !equalInts(got, before) {
+				t.Errorf("active positions changed on rejected move: got %v, want %v", got, before)
+			}
+		})
+	}
+}
+
+// equalInts reports whether two int slices are equal in order.
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // equalIDs reports whether two id slices are equal in order.
 func equalIDs(a, b []int64) bool {
 	if len(a) != len(b) {

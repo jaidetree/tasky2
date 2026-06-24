@@ -34,6 +34,13 @@ var ErrCancelRejected = errors.New("cancel rejected: task is missing or already 
 // Not Found, not a 500.
 var ErrTaskNotFound = errors.New("task not found")
 
+// ErrMoveRejected is returned when a Move targets no live active row: the Task
+// is missing, completed, or cancelled (only Pending + In Progress tasks are in
+// the active ordering that Move reorders). Mirroring Cancel's simplicity, the
+// only rejection is "not a live active task". The API maps this to a 404 Not
+// Found, not a 500.
+var ErrMoveRejected = errors.New("move rejected: task is not a live active task")
+
 // Service holds the Task lifecycle rules. It sits between the HTTP handlers and
 // the Store. maxInProgress is the configurable concurrency limit (default 1,
 // scales to 3) enforced server-side; it is unused until the Pick slice but is
@@ -124,4 +131,14 @@ func (s *Service) Edit(ctx context.Context, id int64, title, notes *string) (Tas
 		title = &trimmed
 	}
 	return s.store.Edit(ctx, id, title, notes)
+}
+
+// Move repositions a single live active Task (Pending or In Progress) to the
+// given 0-based index within the active ordering and renumbers the whole active
+// set to contiguous positions, all in one transaction. position is clamped to
+// the bounds of the active list, so an out-of-range index lands the Task last.
+// If the id is not a live active task it returns ErrMoveRejected (mapped by the
+// API to a 404).
+func (s *Service) Move(ctx context.Context, id int64, position int) (Task, error) {
+	return s.store.Move(ctx, id, position)
 }

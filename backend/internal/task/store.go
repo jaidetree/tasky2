@@ -199,3 +199,96 @@ func (s *Store) Edit(ctx context.Context, id int64, title, notes *string) (Task,
 	}
 	return t, err
 }
+
+// Move repositions one live active Task within the active ordering and renumbers
+// the WHOLE active set to contiguous 0..n-1 positions in a single transaction —
+// the first endpoint needing an explicit pgx transaction, because the renumber
+// is a read-then-write that must be isolated. The active set is locked FOR
+// UPDATE, the move is computed in Go (remove, clamp the target index, splice
+// back in), then one bulk UPDATE writes every active row's new position. Only
+// active rows are touched; completed/cancelled positions are left alone. A target
+// id that is not in the locked active set rolls back and returns ErrMoveRejected.
+func (s *Store) Move(ctx context.Context, id int64, position int) (Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Task{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx,
+		`SELECT id FROM tasks
+		  WHERE deleted_at IS NULL
+		    AND status IN ('pending', 'in_progress')
+		  ORDER BY position ASC, id ASC
+		  FOR UPDATE`)
+	if err != nil {
+		return Task{}, err
+	}
+	current := make([]int64, 0)
+	for rows.Next() {
+		var rowID int64
+		if err := rows.Scan(&rowID); err != nil {
+			rows.Close()
+			return Task{}, err
+		}
+		current = append(current, rowID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Task{}, err
+	}
+
+	// Remove the moved id from the current order; if it was never there, the
+	// Task is missing, completed, or cancelled — not a live active task.
+	remaining := make([]int64, 0, len(current))
+	found := false
+	for _, rowID := range current {
+		if rowID == id {
+			found = true
+			continue
+		}
+		remaining = append(remaining, rowID)
+	}
+	if !found {
+		return Task{}, ErrMoveRejected
+	}
+
+	// Clamp the target into [0, len(remaining)] and splice the moved id back in.
+	target := position
+	if target < 0 {
+		target = 0
+	}
+	if target > len(remaining) {
+		target = len(remaining)
+	}
+	newOrder := make([]int64, 0, len(current))
+	newOrder = append(newOrder, remaining[:target]...)
+	newOrder = append(newOrder, id)
+	newOrder = append(newOrder, remaining[target:]...)
+
+	positions := make([]int32, len(newOrder))
+	for i := range newOrder {
+		positions[i] = int32(i)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET position = data.pos
+		   FROM (SELECT unnest($1::bigint[]) AS id,
+		                unnest($2::int[]) AS pos) AS data
+		  WHERE tasks.id = data.id`,
+		newOrder, positions); err != nil {
+		return Task{}, err
+	}
+
+	row := tx.QueryRow(ctx,
+		`SELECT `+taskColumns+` FROM tasks WHERE id = $1`, id)
+	t, err := scanTask(row)
+	if err != nil {
+		return Task{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Task{}, err
+	}
+	return t, nil
+}
